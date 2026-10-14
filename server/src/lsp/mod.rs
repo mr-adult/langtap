@@ -6,16 +6,21 @@ use axum::{
         State, WebSocketUpgrade,
         ws::{Message as AxumWsMessage, WebSocket},
     },
-    http::Response as HttpResponse,
+    http::{HeaderMap, Response as HttpResponse, StatusCode, Uri},
 };
 use futures::{Sink, SinkExt, Stream, StreamExt};
 use lsp_types::{InitializeParams, InitializeResult, InitializedParams};
 use sqlx::PgPool;
 use time::OffsetDateTime;
-use tokio::sync::{Mutex, RwLock};
+use tokio::{
+    net::TcpStream,
+    sync::{Mutex, RwLock},
+};
 use tokio_tungstenite::{
-    connect_async,
-    tungstenite::{self, Message as TokioWsMessage},
+    MaybeTlsStream, WebSocketStream, connect_async,
+    tungstenite::{
+        self, ClientRequestBuilder, Message as TokioWsMessage, handshake::client::Response,
+    },
 };
 use tracing::{error, info_span};
 
@@ -28,17 +33,63 @@ mod server_to_client_proxy;
 
 pub(crate) async fn handle_ws(
     ws: WebSocketUpgrade,
+    headers: HeaderMap,
     State(state): State<AppState>,
-) -> HttpResponse<Body> {
-    ws.on_upgrade(|socket| handle_ws_upgrade(socket, state))
+) -> Result<HttpResponse<Body>, StatusCode> {
+    let session_id = start_session(&state.db)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let session_span = info_span!("session_id", session_id = session_id);
+    let _session_span_handle = session_span.enter();
+
+    let server_socket = match connect_to_server((*state.forward_url).clone(), headers).await {
+        Ok((socket, _)) => socket,
+        Err(err) => {
+            error!("Failed to connect to the server. Error: {err}");
+            return Err(StatusCode::BAD_GATEWAY);
+        }
+    };
+
+    Ok(ws.on_upgrade(move |socket| handle_ws_upgrade(session_id, socket, server_socket, state)))
 }
 
-async fn handle_ws_upgrade(client_socket: WebSocket, state: AppState) {
-    run_session_with_client(client_socket, state).await.ok();
+async fn handle_ws_upgrade(
+    session_id: i64,
+    client_socket: WebSocket,
+    server_socket: WebSocketStream<MaybeTlsStream<TcpStream>>,
+    state: AppState,
+) {
+    run_session_with_client(session_id, client_socket, server_socket, state)
+        .await
+        .ok();
+}
+
+pub(crate) async fn connect_to_server(
+    server_url: Uri,
+    headers: HeaderMap,
+) -> Result<
+    (WebSocketStream<MaybeTlsStream<TcpStream>>, Response),
+    tokio_tungstenite::tungstenite::Error,
+> {
+    let mut request = ClientRequestBuilder::new(server_url);
+
+    // Transfer any headers across.
+    for header in headers {
+        if let Some(header_name) = header.0 {
+            if let Ok(header_str) = header.1.to_str() {
+                request = request.with_header(header_name.as_str(), header_str)
+            }
+        }
+    }
+
+    connect_async(request).await
 }
 
 pub(crate) async fn run_session_with_client<ClientStream, ClientError>(
-    mut client_stream: ClientStream,
+    session_id: i64,
+    client_stream: ClientStream,
+    server_socket: WebSocketStream<MaybeTlsStream<TcpStream>>,
     state: AppState,
 ) -> Result<i64, ()>
 where
@@ -46,28 +97,6 @@ where
     ClientStream::Error: Display,
     ClientError: Display,
 {
-    let session_id = match start_session(&state.db).await {
-        Ok(session_id) => session_id,
-        Err(_) => {
-            // Close the socket. If it errors then the socket was already closed.
-            client_stream.send(AxumWsMessage::Close(None)).await.ok();
-            return Err(());
-        }
-    };
-
-    let session_span = info_span!("session_id", session_id = session_id);
-    let _session_span_handle = session_span.enter();
-
-    let server_socket = match connect_async(state.forward_url.as_ref()).await {
-        Ok((ws, _)) => ws,
-        Err(err) => {
-            error!("Failed to connect to the server. Error: {err}");
-            // Close the socket. If it errors then the socket was already closed.
-            client_stream.send(AxumWsMessage::Close(None)).await.ok();
-            return Ok(session_id);
-        }
-    };
-
     main_loop(server_socket, client_stream, state.clone(), session_id).await;
 
     if let Err(err) = sqlx::query("UPDATE sessions SET end_time_stamp = $1 WHERE id = $2")

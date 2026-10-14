@@ -10,7 +10,7 @@ use std::{
 
 use axum::{
     extract::{Query, State, ws::Message as AxumWsMessage},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::Redirect,
 };
 use futures::{Sink, Stream};
@@ -22,7 +22,7 @@ use lsp_types::{
 use serde::Deserialize;
 use serde_json::Value;
 use time::OffsetDateTime;
-use tracing::error;
+use tracing::{error, info_span};
 
 use crate::{
     AppState,
@@ -65,8 +65,21 @@ pub async fn handle_replay(
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     })?;
 
+    let session_id = lsp::start_session(&app_state.db)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let session_span = info_span!("session_id", session_id = session_id);
+    let _session_span_handle: tracing::span::Entered<'_> = session_span.enter();
+
     let client_stream = Messages::new(conversation, termination_message, message_kind);
-    match lsp::run_session_with_client(client_stream, app_state).await {
+    let server_socket =
+        lsp::connect_to_server((*app_state.forward_url).clone(), HeaderMap::default())
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            .0;
+
+    match lsp::run_session_with_client(session_id, client_stream, server_socket, app_state).await {
         Err(()) => Err(StatusCode::INTERNAL_SERVER_ERROR),
         Ok(session_id) => Ok(Redirect::to(&format!("/session?session_id={}", session_id))),
     }
