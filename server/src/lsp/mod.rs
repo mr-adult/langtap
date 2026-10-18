@@ -22,7 +22,7 @@ use tokio_tungstenite::{
         self, ClientRequestBuilder, Message as TokioWsMessage, handshake::client::Response,
     },
 };
-use tracing::{error, info_span};
+use tracing::{Instrument, error, info_span, instrument};
 
 use crate::AppState;
 
@@ -31,6 +31,7 @@ mod lsp_session;
 use lsp_session::LspSession;
 mod server_to_client_proxy;
 
+#[instrument(skip(ws, headers, state))]
 pub(crate) async fn handle_ws(
     ws: WebSocketUpgrade,
     headers: HeaderMap,
@@ -41,12 +42,16 @@ pub(crate) async fn handle_ws(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     let session_span = info_span!("session_id", session_id = session_id);
-    let _session_span_handle = session_span.enter();
 
-    let server_socket = match connect_to_server((*state.forward_url).clone(), headers).await {
+    let server_socket = match connect_to_server((*state.forward_url).clone(), headers)
+        .instrument(session_span.clone())
+        .await
+    {
         Ok((socket, _)) => socket,
         Err(err) => {
-            error!("Failed to connect to the server. Error: {err}");
+            session_span.in_scope(|| {
+                error!("Failed to connect to the server. Error: {err}");
+            });
             end_session(&state.db, session_id).await.ok();
 
             match err {
@@ -80,7 +85,9 @@ pub(crate) async fn handle_ws(
         }
     };
 
-    Ok(ws.on_upgrade(move |socket| handle_ws_upgrade(session_id, socket, server_socket, state)))
+    Ok(ws.on_upgrade(move |socket| {
+        handle_ws_upgrade(session_id, socket, server_socket, state).instrument(session_span)
+    }))
 }
 
 async fn handle_ws_upgrade(
