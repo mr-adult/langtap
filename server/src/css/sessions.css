@@ -148,6 +148,15 @@ a:hover {
         0 0 10px rgba(157,220,254,0.5);
 }
 
+#pagination_button_row {
+    display: grid;
+    grid-template-columns: 1fr 1fr 1fr;
+    align-items: center;
+    max-width: 100%;
+    min-width: 0;
+    padding: 10px 50px;
+}
+
 @media (max-width: 700px) {
     body {
         padding: 18px;

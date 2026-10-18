@@ -41,6 +41,8 @@ pub(crate) struct PagedSessionRequest {
     sort_asc: Option<bool>,
 }
 
+const SESSIONS_PER_PAGE: usize = 1000;
+
 pub(crate) async fn get_sessions(
     State(state): State<AppState>,
     Query(request): Query<PagedSessionRequest>,
@@ -58,7 +60,7 @@ pub(crate) async fn get_sessions(
             order_bys.push((column, "DESC"));
         }
     }
-    
+
     order_bys.push(("id", "DESC"));
 
     let mut order_by = String::new();
@@ -74,9 +76,10 @@ pub(crate) async fn get_sessions(
     }
 
     let sessions = sqlx::query(&format!(
-        "SELECT id, start_time_stamp, end_time_stamp FROM sessions {} LIMIT 100 OFFSET {};",
+        "SELECT id, start_time_stamp, end_time_stamp FROM sessions {} LIMIT {} OFFSET {};",
         order_by,
-        request.page.unwrap_or(0) * 100
+        SESSIONS_PER_PAGE,
+        request.page.unwrap_or(0) * SESSIONS_PER_PAGE
     ))
     .map(|row: sqlx::postgres::PgRow| Session {
         id: row.get("id"),
@@ -103,6 +106,52 @@ pub(crate) async fn get_sessions(
     html.push_str(include_str!("../css/sessions.css"));
     html.push_str("</style>");
     html.push_str(include_str!("./branding.html"));
+
+    html.push_str("<div id=\"pagination_button_row\">");
+    {
+        let current_page = request.page.unwrap_or(0);
+        let prev_page = match current_page {
+            0 => None,
+            value => Some(value - 1),
+        };
+        let next_page = current_page + 1;
+
+        let href = if let Some(sort_by) = request.sort_by {
+            let mut href = build_sorted_query_string(
+                &request,
+                SortColumn::try_from(sort_by)
+                    .expect("earlier validation to catch errors with this property"),
+            );
+            href.push_str("&page=");
+            href
+        } else {
+            "/?page=".to_string()
+        };
+
+        let prev_page_href = prev_page.map(|page| {
+            let mut inner_href = href.clone();
+            inner_href.push_str(&page.to_string());
+            inner_href
+        });
+        let mut next_page_href = href;
+        next_page_href.push_str(&next_page.to_string());
+
+        if let Some(prev_page_href) = prev_page_href {
+            html.push_str("<a id=\"prev_page\" class=\"link_button\" href=\"");
+            html.push_str(&prev_page_href);
+            html.push_str("\" style=\"text-align: center;\">Previous</a>");
+        } else {
+            html.push_str("<span aria-hidden=\"true\"></span>");
+        }
+
+        html.push_str(&format!("<h3 style=\"text-align: center;\">Page {}</h3>", request.page.unwrap_or(0)));
+
+        html.push_str("<a id=\"next_page\" class=\"link_button\" href=\"");
+        html.push_str(&next_page_href);
+        html.push_str("\" style=\"text-align: center;\">Next</a>");
+    }
+    html.push_str("</div>");
+
     html.push_str("<div class=\"table_container\">");
     html.push_str("<table>");
     html.push_str("<thead>");
@@ -111,10 +160,14 @@ pub(crate) async fn get_sessions(
 
     html.push_str("<th><a href=\"");
     html.push_str(&build_sorted_query_string(&request, SortColumn::StartTime));
+    html.push_str("&page=");
+    html.push_str(&request.page.unwrap_or(0).to_string());
     html.push_str("\">Start Time</a></th>");
 
     html.push_str("<th><a href=\"");
     html.push_str(&build_sorted_query_string(&request, SortColumn::EndTime));
+    html.push_str("&page=");
+    html.push_str(&request.page.unwrap_or(0).to_string());
     html.push_str("\">End Time</a></th>");
 
     html.push_str("<th>Link</th>");
@@ -156,8 +209,8 @@ pub(crate) async fn get_sessions(
 
     html.push_str("</table>");
     html.push_str("</div>");
-    html.push_str("</body>");
 
+    html.push_str("</body>");
     html.push_str("</html>");
 
     Ok(Html(html))
@@ -168,13 +221,6 @@ fn build_sorted_query_string(
     sort_column_to_toggle: SortColumn,
 ) -> String {
     let mut url = "/?".to_string();
-    if let Some(page) = request.page {
-        url.push_str("page=");
-        url.push_str(&page.to_string());
-
-        url.push('&');
-    }
-
     match request.sort_by {
         None => {
             url.push_str("sort_by=");
