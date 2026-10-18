@@ -34,7 +34,7 @@ use serde_json::Value;
 use sqlx::{PgPool, Row};
 use time::OffsetDateTime;
 use tokio::sync::RwLock;
-use tracing::{Span, error, info_span};
+use tracing::{Instrument, Span, error, info_span};
 
 use crate::{
     message::{ErrorCode, MessageKind, Notification, Request, RequestId, Response},
@@ -382,29 +382,28 @@ impl<'db> LspSession<'db> {
         request: Request,
         source: MessageSource,
         received_time: OffsetDateTime,
-    ) -> Option<Span> {
+    ) -> Span {
         let request_id = request.id.clone();
 
         match self.log_request(request, source, received_time).await {
             Ok(db_request_id) => {
-                let span = Some(info_span!("request_id", request_id = db_request_id));
-                let handle = span.as_ref().map(|span| span.enter());
+                let request_span = info_span!("request_id", request_id = db_request_id);
 
                 if let Some(previous) = {
                     self.unresponded_requests
                         .write()
+                        .instrument(request_span.clone())
                         .await
                         .insert(request_id, db_request_id)
                 } {
                     error!("Received a duplicate request with ID: `{previous}`");
                 }
 
-                drop(handle);
-                span
+                request_span
             }
             Err(err) => {
                 error!("Failed to log request. Error: {}", err);
-                None
+                info_span!("request_id")
             }
         }
     }
@@ -627,19 +626,19 @@ impl<'db> LspSession<'db> {
         response: Response,
         source: MessageSource,
         received_time: OffsetDateTime,
-    ) -> Option<(i64, Span)> {
+    ) -> (Option<i64>, Span) {
         let request_response_db_id = self
             .log_response(response.clone(), source, received_time)
             .await;
 
         match request_response_db_id {
-            Ok(response_id) => Some((
-                response_id,
+            Ok(response_id) => (
+                Some(response_id),
                 info_span!("response_id", response_id = response_id),
-            )),
+            ),
             Err(err) => {
                 error!("Failed to log response `{}`. Error: {}", response.id, err);
-                None
+                (None, info_span!("response_id"))
             }
         }
     }
@@ -984,15 +983,15 @@ impl<'db> LspSession<'db> {
         notification: Notification,
         source: MessageSource,
         received_time: OffsetDateTime,
-    ) -> Option<Span> {
+    ) -> Span {
         match self
             .log_notification(notification.clone(), source, received_time)
             .await
         {
-            Ok(id) => Some(info_span!("notification_id", notification_id = id)),
+            Ok(id) => info_span!("notification_id", notification_id = id),
             Err(err) => {
                 error!("Failed to log a notification to the database. Error: {err}");
-                None
+                info_span!("notification_id")
             }
         }
     }

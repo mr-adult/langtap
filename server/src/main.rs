@@ -141,7 +141,7 @@ pub async fn main() -> ExitCode {
         .with(
             EnvFilter::from_default_env()
                 // this directive prevent sqlx from infinitely logggin its own events.
-                .add_directive("lls".parse().unwrap()),
+                .add_directive("langtap".parse().unwrap()),
         )
         .with(PostgresLayer::from(pool.clone()))
         .init();

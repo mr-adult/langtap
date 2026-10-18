@@ -13,7 +13,7 @@ use lsp_types::{
 use time::OffsetDateTime;
 use tokio::sync::{Mutex, RwLock};
 use tokio_tungstenite::tungstenite::Message as TokioWsMessage;
-use tracing::{error, warn};
+use tracing::{Instrument, error, warn};
 
 use crate::{
     lsp::{LspSession, Shutdown, Uninitialized},
@@ -283,139 +283,20 @@ where
                         .session
                         .start_request(request.clone(), MessageSource::Client, received_time)
                         .await;
-                    let _handle = span.as_ref().map(|span| span.enter());
 
-                    Self::validate_message_kind_and_sender(
-                        MessageKind::Request,
-                        request.method.as_str(),
-                    );
-
-                    if let Initialize::METHOD = request.method.as_str() {
-                        let initialize_params = match serde_json::from_value::<InitializeParams>(
-                            request.params.clone(),
-                        ) {
-                            Ok(initialize_params) => initialize_params,
-                            Err(err) => {
-                                match self
-                                    .send_response_skipping_server(
-                                        Response::new_err(
-                                            request.id,
-                                            ErrorCode::InvalidParams as i32,
-                                            format!("{}", err),
-                                        ),
-                                        received_time,
-                                    )
-                                    .await
-                                {
-                                    Ok(()) => continue,
-                                    Err(err) => {
-                                        error!(
-                                            "Failed to send an interrupt response back to the client. Error: {err}"
-                                        );
-                                        break;
-                                    }
-                                }
-                            }
-                        };
-
-                        let params_clone_for_storage = initialize_params.clone();
-                        {
-                            let mut write_lock = self.state.write().await;
-                            if write_lock.initialized_params.is_some() {
-                                drop(write_lock);
-
-                                match self
-                                    .send_response_skipping_server(
-                                        Response::new_err(
-                                            request.id,
-                                            ErrorCode::RequestFailed as i32,
-                                            "The server already received an initialize request."
-                                                .to_string(),
-                                        ),
-                                        received_time,
-                                    )
-                                    .await
-                                {
-                                    Ok(()) => continue,
-                                    Err(err) => {
-                                        error!(
-                                            "Failed to send an interrupt response back to the client. Error: {err}"
-                                        );
-                                        break;
-                                    }
-                                };
-                            }
-
-                            write_lock.initialize_params = Some(params_clone_for_storage);
-                        }
-
-                        match self.proxy_request(request).await {
-                            Ok(()) => {}
-                            Err(err) => {
-                                error!("Failed to proxy a response to the client. Error: {err}");
-                                break;
-                            }
-                        };
-                    } else {
-                        match self
-                            .send_response_skipping_server(
-                                Response::new_err(
-                                    request.id,
-                                    ErrorCode::ServerNotInitialized as i32,
-                                    "".to_string(),
-                                ),
-                                received_time,
-                            )
-                            .await
-                        {
-                            Ok(()) => continue,
-                            Err(err) => {
-                                error!(
-                                    "Failed to send an interrupt response back to the client. Error: {err}"
-                                );
-                                break;
-                            }
-                        }
+                    if self.handle_request(request, received_time).instrument(span).await.is_err() {
+                        break;
                     }
                 }
                 LspMessage::Response(response) => {
-                    let response_id_and_span = self
+                    let (_, span) = self
                         .session
                         .start_response(response.clone(), MessageSource::Client, received_time)
                         .await;
-                    let _handle = response_id_and_span.as_ref().map(|span| span.1.enter());
 
-                    match self.session.get_request_for_response(&response).await {
-                        Err(_) | Ok(None) => {}
-                        Ok(Some((_, request))) => {
-                            Self::validate_message_kind_and_sender(
-                                MessageKind::Response,
-                                request.method.as_str(),
-                            );
-
-                            match request.method.as_str() {
-                                ShowMessageRequest::METHOD => {}
-                                other => {
-                                    error!(
-                                        "Received response for `{other}` request before initialization was complete."
-                                    );
-                                }
-                            }
-
-                            LspSession::validate_response(
-                                request.method.as_str(),
-                                response.clone(),
-                            );
-                        }
-                    };
-
-                    match self.proxy_response(response).await {
-                        Ok(()) => {}
-                        Err(err) => {
-                            error!("Failed to proxy a response to the client. Error: {err}");
-                            break;
-                        }
-                    };
+                    if self.handle_response(response).instrument(span).await.is_err() {
+                        break;
+                    }
                 }
                 LspMessage::Notification(notification) => {
                     let span = self
@@ -426,31 +307,42 @@ where
                             received_time,
                         )
                         .await;
-                    let _handle = span.as_ref().map(|span| span.enter());
 
-                    Self::validate_message_kind_and_sender(
-                        MessageKind::Notification,
-                        notification.method.as_str(),
-                    );
+                    span.in_scope(|| {
+                        Self::validate_message_kind_and_sender(
+                            MessageKind::Notification,
+                            notification.method.as_str(),
+                        );
+                    });
 
                     match notification.method.as_str() {
                         Initialized::METHOD => {
-                            match serde_json::from_value(notification.params.clone()) {
+                            let value = span
+                                .in_scope(|| serde_json::from_value(notification.params.clone()));
+                            match value {
                                 Ok(params) => {
                                     let new_state;
                                     {
-                                        let mut write_lock = self.state.write().await;
+                                        let mut write_lock =
+                                            self.state.write().instrument(span.clone()).await;
                                         if write_lock.initialize_params.is_none()
                                             || write_lock.initialize_result.is_none()
                                         {
-                                            write_lock.failed = true;
-                                            error!(
-                                                "Received `{}` notification before initialize request was processed.",
-                                                Initialized::METHOD
-                                            );
-                                            drop(write_lock);
+                                            span.in_scope(|| {
+                                                write_lock.failed = true;
+                                                error!(
+                                                    "Received `{}` notification before initialize request was processed.",
+                                                    Initialized::METHOD
+                                                );
+                                                drop(write_lock);
+                                            });
                                             // just hang up
-                                            *self.session.exited.write().await = true;
+                                            *self
+                                                .session
+                                                .exited
+                                                .write()
+                                                .instrument(span.clone())
+                                                .await = true;
                                             return Err(());
                                         }
 
@@ -484,29 +376,44 @@ where
                                     });
                                 }
                                 Err(err) => {
-                                    error!(
-                                        "Failed to parse `{}` params. Error: {}",
-                                        Initialized::METHOD,
-                                        err
-                                    );
+                                    span.in_scope(|| {
+                                        error!(
+                                            "Failed to parse `{}` params. Error: {}",
+                                            Initialized::METHOD,
+                                            err
+                                        );
+                                    });
 
-                                    self.state.write().await.initialized_params =
-                                        Some(InitializedParams {})
+                                    self.state
+                                        .write()
+                                        .instrument(span.clone())
+                                        .await
+                                        .initialized_params = Some(InitializedParams {})
                                 }
                             }
                         }
                         other => {
-                            error!(
-                                "received a `{}` notification before initialization was completed.",
-                                other
-                            );
+                            span.in_scope(|| {
+                                error!(
+                                    "received a `{}` notification before initialization was completed.",
+                                    other
+                                );
+                            });
                         }
                     }
 
-                    match self.proxy_notification(notification).await {
+                    match self
+                        .proxy_notification(notification)
+                        .instrument(span.clone())
+                        .await
+                    {
                         Ok(()) => {}
                         Err(err) => {
-                            error!("Failed to proxy a notification to the server. Error: {err}");
+                            span.in_scope(|| {
+                                error!(
+                                    "Failed to proxy a notification to the server. Error: {err}"
+                                );
+                            });
                             break;
                         }
                     }
@@ -516,6 +423,130 @@ where
 
         *self.session.exited.write().await = true;
         Err(())
+    }
+
+    async fn handle_request(
+        &mut self,
+        request: Request,
+        received_at: OffsetDateTime,
+    ) -> Result<(), ()> {
+        Self::validate_message_kind_and_sender(MessageKind::Request, request.method.as_str());
+
+        if let Initialize::METHOD = request.method.as_str() {
+            let initialize_params = match serde_json::from_value::<InitializeParams>(
+                request.params.clone(),
+            ) {
+                Ok(initialize_params) => initialize_params,
+                Err(err) => {
+                    match self
+                        .send_response_skipping_server(
+                            Response::new_err(
+                                request.id,
+                                ErrorCode::InvalidParams as i32,
+                                format!("{}", err),
+                            ),
+                            received_at,
+                        )
+                        .await
+                    {
+                        Ok(()) => return Ok(()),
+                        Err(err) => {
+                            error!(
+                                "Failed to send an interrupt response back to the client. Error: {err}"
+                            );
+                            return Err(());
+                        }
+                    }
+                }
+            };
+
+            let params_clone_for_storage = initialize_params.clone();
+            {
+                let mut write_lock = self.state.write().await;
+                if write_lock.initialized_params.is_some() {
+                    drop(write_lock);
+
+                    match self
+                        .send_response_skipping_server(
+                            Response::new_err(
+                                request.id,
+                                ErrorCode::RequestFailed as i32,
+                                "The server already received an initialize request.".to_string(),
+                            ),
+                            received_at,
+                        )
+                        .await
+                    {
+                        Ok(()) => return Ok(()),
+                        Err(err) => {
+                            error!(
+                                "Failed to send an interrupt response back to the client. Error: {err}"
+                            );
+                            return Err(());
+                        }
+                    };
+                }
+
+                write_lock.initialize_params = Some(params_clone_for_storage);
+            }
+
+            match self.proxy_request(request).await {
+                Ok(()) => Ok(()),
+                Err(err) => {
+                    error!("Failed to proxy a response to the client. Error: {err}");
+                    Err(())
+                }
+            }
+        } else {
+            match self
+                .send_response_skipping_server(
+                    Response::new_err(
+                        request.id,
+                        ErrorCode::ServerNotInitialized as i32,
+                        "".to_string(),
+                    ),
+                    received_at,
+                )
+                .await
+            {
+                Ok(()) => Ok(()),
+                Err(err) => {
+                    error!("Failed to send an interrupt response back to the client. Error: {err}");
+                    Err(())
+                }
+            }
+        }
+    }
+
+    async fn handle_response(&mut self, response: Response) -> Result<(), ()> {
+        match self.session.get_request_for_response(&response).await {
+            Err(_) | Ok(None) => {}
+            Ok(Some((_, request))) => {
+                Self::validate_message_kind_and_sender(
+                    MessageKind::Response,
+                    request.method.as_str(),
+                );
+
+                match request.method.as_str() {
+                    ShowMessageRequest::METHOD => {}
+                    other => {
+                        error!(
+                            "Received response for `{other}` request before initialization was complete."
+                        );
+                    }
+                }
+
+                LspSession::validate_response(request.method.as_str(), response.clone());
+            }
+        };
+
+        match self.proxy_response(response).await {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                error!("Failed to proxy a response to the client. Error: {err}");
+                Err(())
+            }
+        }
     }
 }
 
@@ -559,82 +590,18 @@ where
                         .session
                         .start_request(request.clone(), MessageSource::Client, received_time)
                         .await;
-                    let _handle = span.as_ref().map(|span| span.enter());
 
-                    Self::validate_message_kind_and_sender(
-                        MessageKind::Request,
-                        request.method.as_str(),
-                    );
-
-                    match LspSession::validate_request_params(request.clone()).await {
-                        Ok(()) => {}
-                        Err(response) => {
-                            match self
-                                .send_response_skipping_server(response, OffsetDateTime::now_utc())
-                                .await
-                            {
-                                Ok(()) => {}
-                                Err(err) => {
-                                    error!(
-                                        "Failed to send an interrupt response back to the client. Error: {err}"
-                                    );
-                                    *self.session.exited.write().await = true;
-                                    return Err(());
-                                }
-                            };
-                        }
-                    };
-
-                    match self.proxy_request(request).await {
-                        Ok(()) => {}
-                        Err(err) => {
-                            error!("Failed to proxy a request to the server. Error: {err}");
-                            *self.session.exited.write().await = true;
-                            return Err(());
-                        }
-                    };
+                    self.handle_request(request).instrument(span).await?;
                 }
                 LspMessage::Response(response) => {
-                    let request_id_and_span = self
+                    let (request_id, span) = self
                         .session
                         .start_response(response.clone(), MessageSource::Client, received_time)
                         .await;
 
-                    let mut request_id = None;
-                    let _handle = request_id_and_span.as_ref().map(|request_id_and_span| {
-                        request_id = Some(request_id_and_span.0);
-                        request_id_and_span.1.enter()
-                    });
-
-                    if let Some(db_id) = request_id {
-                        match self
-                            .session
-                            .get_request_from_id(db_id, response.id.clone())
-                            .await
-                        {
-                            Err(_) => {}
-                            Ok(request) => {
-                                Self::validate_message_kind_and_sender(
-                                    MessageKind::Response,
-                                    request.method.as_str(),
-                                );
-
-                                LspSession::validate_response(
-                                    request.method.as_str(),
-                                    response.clone(),
-                                );
-                            }
-                        };
-                    }
-
-                    match self.proxy_response(response).await {
-                        Ok(()) => {}
-                        Err(err) => {
-                            error!("Failed to proxy a response to the client. Error: {err}");
-                            *self.session.exited.write().await = true;
-                            return Err(());
-                        }
-                    }
+                    self.handle_response(request_id, response)
+                        .instrument(span)
+                        .await?;
                 }
                 LspMessage::Notification(notification) => {
                     let span = self
@@ -645,38 +612,108 @@ where
                             received_time,
                         )
                         .await;
-                    let _handle = span.as_ref().map(|span| span.enter());
 
-                    Self::validate_message_kind_and_sender(
-                        MessageKind::Notification,
-                        notification.method.as_str(),
-                    );
-                    LspSession::validate_notification_params(notification.clone());
-
-                    match notification.method.as_str() {
-                        Initialized::METHOD => {
-                            error!(
-                                "Received an `{}` notification after initialization had already been completed.",
-                                Initialized::METHOD,
-                            );
-                        }
-                        _ => {}
-                    }
-
-                    match self.proxy_notification(notification).await {
-                        Ok(()) => {}
-                        Err(err) => {
-                            error!("Failed to proxy a response to the client. Error: {err}");
-                            *self.session.exited.write().await = true;
-                            return Err(());
-                        }
-                    }
+                    self.handle_notification(notification)
+                        .instrument(span)
+                        .await?;
                 }
             }
         }
 
         *self.session.exited.write().await = true;
         Err(())
+    }
+
+    async fn handle_request(&mut self, request: Request) -> Result<(), ()> {
+        Self::validate_message_kind_and_sender(MessageKind::Request, request.method.as_str());
+
+        match LspSession::validate_request_params(request.clone()).await {
+            Ok(()) => {}
+            Err(response) => {
+                match self
+                    .send_response_skipping_server(response, OffsetDateTime::now_utc())
+                    .await
+                {
+                    Ok(()) => {}
+                    Err(err) => {
+                        error!(
+                            "Failed to send an interrupt response back to the client. Error: {err}"
+                        );
+                        *self.session.exited.write().await = true;
+                        return Err(());
+                    }
+                };
+            }
+        };
+
+        match self.proxy_request(request).await {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                error!("Failed to proxy a request to the server. Error: {err}");
+                *self.session.exited.write().await = true;
+                Err(())
+            }
+        }
+    }
+
+    async fn handle_response(
+        &mut self,
+        request_id: Option<i64>,
+        response: Response,
+    ) -> Result<(), ()> {
+        if let Some(db_id) = request_id {
+            match self
+                .session
+                .get_request_from_id(db_id, response.id.clone())
+                .await
+            {
+                Err(_) => {}
+                Ok(request) => {
+                    Self::validate_message_kind_and_sender(
+                        MessageKind::Response,
+                        request.method.as_str(),
+                    );
+
+                    LspSession::validate_response(request.method.as_str(), response.clone());
+                }
+            };
+        }
+
+        match self.proxy_response(response).await {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                error!("Failed to proxy a response to the client. Error: {err}");
+                *self.session.exited.write().await = true;
+                return Err(());
+            }
+        }
+    }
+
+    async fn handle_notification(&mut self, notification: Notification) -> Result<(), ()> {
+        Self::validate_message_kind_and_sender(
+            MessageKind::Notification,
+            notification.method.as_str(),
+        );
+        LspSession::validate_notification_params(notification.clone());
+
+        match notification.method.as_str() {
+            Initialized::METHOD => {
+                error!(
+                    "Received an `{}` notification after initialization had already been completed.",
+                    Initialized::METHOD,
+                );
+            }
+            _ => {}
+        }
+
+        match self.proxy_notification(notification).await {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                error!("Failed to proxy a response to the client. Error: {err}");
+                *self.session.exited.write().await = true;
+                return Err(());
+            }
+        }
     }
 }
 
@@ -721,49 +758,18 @@ where
                         .session
                         .start_request(request.clone(), MessageSource::Server, received_time)
                         .await;
-                    let _handle = span.as_ref().map(|span| span.enter());
 
-                    Self::validate_message_kind_and_sender(
-                        MessageKind::Request,
-                        request.method.as_str(),
-                    );
-
-                    match self
-                        .send_response_skipping_server(
-                            Response::new_err(
-                                request.id,
-                                ErrorCode::RequestFailed as i32,
-                                "Server was shut down.".to_string(),
-                            ),
-                            received_time,
-                        )
-                        .await
-                    {
-                        Ok(()) => {}
-                        Err(err) => {
-                            error!(
-                                "Failed to send an interrupt response back to the client. Error: {err}"
-                            );
-                            *self.session.exited.write().await = true;
-                            return;
-                        }
-                    }
+                    self.handle_request(request, received_time)
+                        .instrument(span)
+                        .await;
                 }
                 LspMessage::Response(response) => {
-                    let response_id_and_span = self
+                    let (_, span) = self
                         .session
                         .start_response(response.clone(), MessageSource::Server, received_time)
                         .await;
-                    let _handle = response_id_and_span.as_ref().map(|span| span.1.enter());
 
-                    match self.proxy_response(response).await {
-                        Ok(()) => {}
-                        Err(err) => {
-                            error!("Failed to proxy a response to the server. Error: {err}");
-                            *self.session.exited.write().await = true;
-                            return;
-                        }
-                    };
+                    self.handle_response(response).instrument(span).await;
                 }
                 LspMessage::Notification(notification) => {
                     let span = self
@@ -774,26 +780,65 @@ where
                             received_time,
                         )
                         .await;
-                    let _handle = span.as_ref().map(|span| span.enter());
 
-                    Self::validate_message_kind_and_sender(
-                        MessageKind::Notification,
-                        notification.method.as_str(),
-                    );
-
-                    match self.proxy_notification(notification).await {
-                        Ok(()) => {}
-                        Err(err) => {
-                            error!("Failed to proxy a notification to the server. Error: {err}");
-                            *self.session.exited.write().await = true;
-                            return;
-                        }
-                    }
+                    self.handle_notification(notification)
+                        .instrument(span)
+                        .await;
                 }
             }
         }
 
         *self.session.exited.write().await = true;
+    }
+
+    async fn handle_request(&mut self, request: Request, received_at: OffsetDateTime) {
+        Self::validate_message_kind_and_sender(MessageKind::Request, request.method.as_str());
+
+        match self
+            .send_response_skipping_server(
+                Response::new_err(
+                    request.id,
+                    ErrorCode::RequestFailed as i32,
+                    "Server was shut down.".to_string(),
+                ),
+                received_at,
+            )
+            .await
+        {
+            Ok(()) => {}
+            Err(err) => {
+                error!("Failed to send an interrupt response back to the client. Error: {err}");
+                *self.session.exited.write().await = true;
+                return;
+            }
+        }
+    }
+
+    async fn handle_response(&mut self, response: Response) {
+        match self.proxy_response(response).await {
+            Ok(()) => {}
+            Err(err) => {
+                error!("Failed to proxy a response to the server. Error: {err}");
+                *self.session.exited.write().await = true;
+                return;
+            }
+        };
+    }
+
+    async fn handle_notification(&mut self, notification: Notification) {
+        Self::validate_message_kind_and_sender(
+            MessageKind::Notification,
+            notification.method.as_str(),
+        );
+
+        match self.proxy_notification(notification).await {
+            Ok(()) => {}
+            Err(err) => {
+                error!("Failed to proxy a notification to the server. Error: {err}");
+                *self.session.exited.write().await = true;
+                return;
+            }
+        }
     }
 }
 
