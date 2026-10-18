@@ -47,7 +47,36 @@ pub(crate) async fn handle_ws(
         Ok((socket, _)) => socket,
         Err(err) => {
             error!("Failed to connect to the server. Error: {err}");
-            return Err(StatusCode::BAD_GATEWAY);
+            end_session(&state.db, session_id).await.ok();
+
+            match err {
+                tungstenite::Error::Http(response) => {
+                    match response.status().as_u16() {
+                        // 0..100 and 600.. are not really HTTP codes.
+                        // 100..200 are informational. Just return as-is.
+                        // 300..400 are redirectors. Return as-is.
+                        // 400..500 are errors. Return with full details.
+                        // 500..600 are server errors. Case-by-case.
+                        0..100 | 100..200 | 300..400 | 400..500 | 500..600 | 600.. => {
+                            let (parts, body_bytes) = (*response).into_parts();
+
+                            let body_bytes = body_bytes.unwrap_or_default();
+                            let body = Body::from(body_bytes);
+
+                            let response = HttpResponse::from_parts(parts, body);
+                            return Ok(response);
+                        }
+                        200..300 => {
+                            // These should be success codes, so we shouldn't be in the error path.
+                            // If these happen, treat the server as misbehaving and say bad gateway.
+                            return Err(StatusCode::BAD_GATEWAY);
+                        }
+                    }
+                }
+                _ => {
+                    return Err(StatusCode::BAD_GATEWAY);
+                }
+            }
         }
     };
 
@@ -99,12 +128,7 @@ where
 {
     main_loop(server_socket, client_stream, state.clone(), session_id).await;
 
-    if let Err(err) = sqlx::query("UPDATE sessions SET end_time_stamp = $1 WHERE id = $2")
-        .bind(OffsetDateTime::now_utc())
-        .bind(session_id)
-        .fetch_optional(&state.db)
-        .await
-    {
+    if let Err(err) = end_session(&state.db, session_id).await {
         error!("Failed to write the end_time_stamp. Message: {}", err);
     }
 
@@ -137,12 +161,7 @@ where
 
     main_loop(server_stream, client_stream, state.clone(), session_id).await;
 
-    if let Err(err) = sqlx::query("UPDATE sessions SET end_time_stamp = $1 WHERE id = $2")
-        .bind(OffsetDateTime::now_utc())
-        .bind(session_id)
-        .fetch_optional(&state.db)
-        .await
-    {
+    if let Err(err) = end_session(&state.db, session_id).await {
         error!("Failed to write the end_time_stamp. Message: {}", err);
     }
 
@@ -167,6 +186,15 @@ pub(crate) async fn start_session(db: &PgPool) -> Result<i64, sqlx::Error> {
             return Err(err);
         }
     }
+}
+
+pub(crate) async fn end_session(db: &PgPool, session_id: i64) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE sessions SET end_time_stamp = $1 WHERE id = $2")
+        .bind(OffsetDateTime::now_utc())
+        .bind(session_id)
+        .fetch_optional(db)
+        .await
+        .map(|_| ())
 }
 
 pub(crate) async fn main_loop<ServerStream, ClientStream, ClientError>(
