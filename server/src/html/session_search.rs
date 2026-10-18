@@ -37,56 +37,40 @@ impl TryFrom<usize> for SortColumn {
 #[derive(Deserialize)]
 pub(crate) struct PagedSessionRequest {
     page: Option<usize>,
-    primary_sort: Option<usize>,
-    primary_asc: Option<bool>,
-    secondary_sort: Option<usize>,
-    secondary_asc: Option<bool>,
+    sort_by: Option<usize>,
+    sort_asc: Option<bool>,
 }
 
 pub(crate) async fn get_sessions(
     State(state): State<AppState>,
     Query(request): Query<PagedSessionRequest>,
 ) -> Result<Html<String>, StatusCode> {
+    let mut order_bys = Vec::new();
+    if let Some(sort_by) = request.sort_by {
+        let column = match SortColumn::try_from(sort_by).map_err(|_| StatusCode::BAD_REQUEST)? {
+            SortColumn::StartTime => "start_time_stamp",
+            SortColumn::EndTime => "end_time_stamp",
+        };
+
+        if request.sort_asc.unwrap_or(false) {
+            order_bys.push((column, "ASC"));
+        } else {
+            order_bys.push((column, "DESC"));
+        }
+    }
+    
+    order_bys.push(("id", "DESC"));
+
     let mut order_by = String::new();
-    if let Some(primary_sort) = request.primary_sort {
-        match SortColumn::try_from(primary_sort).map_err(|_| StatusCode::BAD_REQUEST)? {
-            SortColumn::StartTime => order_by.push_str("ORDER BY start_time_stamp"),
-            SortColumn::EndTime => order_by.push_str("ORDER BY end_time_stamp"),
+    order_by.push_str("ORDER BY ");
+    for (i, order) in order_bys.iter().enumerate() {
+        if i != 0 {
+            order_by.push_str(", ");
         }
 
-        if request.primary_asc.unwrap_or(true) {
-            order_by.push_str(" ASC");
-        } else {
-            order_by.push_str(" DESC");
-        }
-
-        if let Some(secondary_sort) = request.secondary_sort {
-            match SortColumn::try_from(secondary_sort).map_err(|_| StatusCode::BAD_REQUEST)? {
-                SortColumn::StartTime => order_by.push_str(", start_time_stamp"),
-                SortColumn::EndTime => order_by.push_str(", end_time_stamp"),
-            }
-
-            if request.secondary_asc.unwrap_or(true) {
-                order_by.push_str(" ASC");
-            } else {
-                order_by.push_str(" DESC");
-            }
-        }
-
-        order_by.push_str(", id");
-    } else if let Some(secondary_sort) = request.secondary_sort {
-        match SortColumn::try_from(secondary_sort).map_err(|_| StatusCode::BAD_REQUEST)? {
-            SortColumn::StartTime => order_by.push_str("ORDER BY start_time_stamp"),
-            SortColumn::EndTime => order_by.push_str("ORDER BY end_time_stamp"),
-        }
-
-        if request.secondary_asc.unwrap_or(true) {
-            order_by.push_str(" ASC");
-        } else {
-            order_by.push_str(" DESC");
-        }
-
-        order_by.push_str(", id");
+        order_by.push_str(order.0);
+        order_by.push(' ');
+        order_by.push_str(order.1);
     }
 
     let sessions = sqlx::query(&format!(
@@ -191,51 +175,27 @@ fn build_sorted_query_string(
         url.push('&');
     }
 
-    match request.primary_sort {
+    match request.sort_by {
         None => {
-            url.push_str("primary_sort=");
+            url.push_str("sort_by=");
             url.push_str(&(sort_column_to_toggle as u8).to_string());
             return url;
         }
-        Some(primary_sort) => {
-            url.push_str("primary_sort=");
-            url.push_str(&primary_sort.to_string());
+        Some(sort_by) => {
+            url.push_str("sort_by=");
+            url.push_str(&(sort_column_to_toggle as u8).to_string());
 
             url.push('&');
-            url.push_str("primary_asc=");
-            if primary_sort == (sort_column_to_toggle as usize) {
-                if request.primary_asc.unwrap_or(true) {
+            url.push_str("sort_asc=");
+            if sort_by == (sort_column_to_toggle as usize) {
+                if request.sort_asc.unwrap_or(true) {
                     url.push_str(&false.to_string());
                 } else {
                     url.push_str(&true.to_string());
                 }
                 return url;
             } else {
-                url.push_str(&request.primary_asc.unwrap_or(true).to_string());
-            }
-        }
-    }
-
-    url.push('&');
-    match request.secondary_sort {
-        None => {
-            url.push_str("secondary_sort=");
-            url.push_str(&(sort_column_to_toggle as u8).to_string());
-        }
-        Some(secondary_sort) => {
-            url.push_str("secondary_sort=");
-            url.push_str(&secondary_sort.to_string());
-
-            url.push('&');
-            url.push_str("secondary_asc=");
-            if secondary_sort == (sort_column_to_toggle as usize) {
-                if request.secondary_asc.unwrap_or(true) {
-                    url.push_str(&false.to_string());
-                } else {
-                    url.push_str(&true.to_string());
-                }
-            } else {
-                url.push_str(&request.secondary_asc.unwrap_or(true).to_string());
+                url.push_str(&false.to_string());
             }
         }
     }
