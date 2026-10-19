@@ -215,7 +215,7 @@ pub(crate) async fn get_session(
     State(state): State<AppState>,
     Query(request): Query<GetSessionParams>,
 ) -> Result<(StatusCode, HeaderMap, Html<String>), StatusCode> {
-    let (session, conversation, protocol_errs) = tokio::join!{
+    let (session, conversation, protocol_errs) = tokio::join! {
         sqlx::query("SELECT id, end_time_stamp FROM sessions WHERE id = $1 LIMIT 1;")
             .bind(request.session_id)
             .fetch_one(&state.db)
@@ -232,11 +232,9 @@ pub(crate) async fn get_session(
         crate::session::get_all_errs_for_session(&state.db, request.session_id)
     };
 
-    let map_sql_err_to_http = |err| {
-        match err {
-            sqlx::Error::RowNotFound => StatusCode::NOT_FOUND,
-            _ => StatusCode::INTERNAL_SERVER_ERROR,
-        }
+    let map_sql_err_to_http = |err| match err {
+        sqlx::Error::RowNotFound => StatusCode::NOT_FOUND,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
     };
 
     let session = session.map_err(map_sql_err_to_http)?;
