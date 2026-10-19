@@ -496,13 +496,13 @@ where
                     }
                 }
                 LspMessage::Response(response) => {
-                    let (request_id, span) = self
+                    let (_, span) = self
                         .session
                         .start_response(response.clone(), MessageSource::Server, received_time)
                         .await;
 
                     if self
-                        .handle_response(request_id, response)
+                        .handle_response(response)
                         .instrument(span)
                         .await
                         .is_err()
@@ -572,28 +572,18 @@ where
         }
     }
 
-    async fn handle_response(
-        &mut self,
-        request_id: Option<i64>,
-        response: Response,
-    ) -> Result<(), ()> {
-        if let Some(db_id) = request_id {
-            match self
-                .session
-                .get_request_from_id(db_id, response.id.clone())
-                .await
-            {
-                Err(_) => {}
-                Ok(request) => {
-                    Self::validate_message_kind_and_sender(
-                        MessageKind::Response,
-                        request.method.as_str(),
-                    );
+    async fn handle_response(&mut self, response: Response) -> Result<(), ()> {
+        match self.session.get_request_for_response(&response).await {
+            Err(_) | Ok(None) => {}
+            Ok(Some((_, request))) => {
+                Self::validate_message_kind_and_sender(
+                    MessageKind::Response,
+                    request.method.as_str(),
+                );
 
-                    LspSession::validate_response(request.method.as_str(), response.clone());
-                }
-            };
-        }
+                LspSession::validate_response(request.method.as_str(), response.clone());
+            }
+        };
 
         match self.proxy_response(response).await {
             Ok(()) => Ok(()),
