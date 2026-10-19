@@ -1,6 +1,6 @@
 use std::{collections::HashSet, iter::Enumerate, vec::IntoIter};
 
-use crate::message::Message;
+use crate::{message::Message, session::SessionErrors};
 use serde_json::{Map, Value};
 
 use crate::{
@@ -14,6 +14,7 @@ pub(crate) fn append_chat_html_to(
     session_id: i64,
     conversation: &Conversation,
     allow_list: &HashSet<Option<MessageClassification>>,
+    protocol_errs: &SessionErrors,
 ) {
     html.push_str("<div id=\"chat\">");
     {
@@ -58,14 +59,35 @@ pub(crate) fn append_chat_html_to(
                     }
                     html.push_str("\">");
                     {
+                        let errs;
                         html.push_str("<summary>");
                         {
                             match &message {
                                 Message::Request(req) => {
+                                    if let Some(request_errs) = protocol_errs
+                                        .request_errs
+                                        .get(&message_with_time_stamp.db_id)
+                                    {
+                                        errs = Some(request_errs);
+                                        html.push_str("⚠️ ");
+                                    } else {
+                                        errs = None;
+                                    }
+
                                     html.push_str("Request: ");
                                     html.push_str(&req.method);
                                 }
                                 Message::Response(resp) => {
+                                    if let Some(response_errs) = protocol_errs
+                                        .response_errs
+                                        .get(&message_with_time_stamp.db_id)
+                                    {
+                                        errs = Some(response_errs);
+                                        html.push_str("⚠️ ");
+                                    } else {
+                                        errs = None;
+                                    }
+
                                     html.push_str("Response: ");
                                     let method = conversation
                                         .requests()
@@ -78,6 +100,16 @@ pub(crate) fn append_chat_html_to(
                                     }
                                 }
                                 Message::Notification(not) => {
+                                    if let Some(notification_errs) = protocol_errs
+                                        .notification_errs
+                                        .get(&message_with_time_stamp.db_id)
+                                    {
+                                        errs = Some(notification_errs);
+                                        html.push_str("⚠️ ");
+                                    } else {
+                                        errs = None;
+                                    }
+
                                     html.push_str("Notification: ");
                                     html.push_str(&not.method);
                                 }
@@ -85,13 +117,28 @@ pub(crate) fn append_chat_html_to(
                         }
                         html.push_str("</summary>");
 
+                        let empty = Vec::with_capacity(0);
+                        let errs = errs.unwrap_or(&empty);
+                        if !errs.is_empty() {
+                            html.push_str("Errors:");
+                            html.push_str("<ul>");
+                            for err in errs {
+                                html.push_str("<li>");
+                                html.push_str(&html_escape::encode_text(&err.message));
+                                html.push_str("</li>");
+                            }
+                            html.push_str("</ul>");
+                        }
+
                         append_json_html_to(html, serde_json::to_value(message.clone()).unwrap());
                     }
                     html.push_str("</details>");
                 }
                 html.push_str("</div>");
 
-                html.push_str(r#"<div style="display: flex; flex-direction: column; row-gap: 4px;"#);
+                html.push_str(
+                    r#"<div style="display: flex; flex-direction: column; row-gap: 4px;"#,
+                );
                 match source {
                     MessageSource::Client => html.push_str("margin-left: 50px; text-align: left;"),
                     MessageSource::Server => {

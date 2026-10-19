@@ -1,3 +1,5 @@
+use std::{collections::HashMap, sync::Arc};
+
 use futures::future;
 use serde_json::Value;
 use sqlx::{PgPool, Row};
@@ -243,4 +245,99 @@ pub(crate) async fn get_all_messages_for_session_in_chronological_order(
     });
 
     Ok(all_messages.into())
+}
+
+pub(crate) struct SessionErrors {
+    pub(crate) session_id: i64,
+    pub(crate) session_errs: Vec<ErrorRow>,
+    pub(crate) request_errs: HashMap<i64, Vec<ErrorRow>>,
+    pub(crate) response_errs: HashMap<i64, Vec<ErrorRow>>,
+    pub(crate) notification_errs: HashMap<i64, Vec<ErrorRow>>,
+}
+
+pub(crate) struct ErrorRow {
+    pub(crate) id: i64,
+    pub(crate) time_stamp: OffsetDateTime,
+    pub(crate) message: Arc<str>,
+}
+
+impl<'a> From<&'a RawErrorRow> for ErrorRow {
+    fn from(value: &'a RawErrorRow) -> Self {
+        Self {
+            id: value.id,
+            time_stamp: value.time_stamp.clone(),
+            message: value.message.clone(),
+        }
+    }
+}
+
+struct RawErrorRow {
+    id: i64,
+    time_stamp: OffsetDateTime,
+    request_id: Option<i64>,
+    response_id: Option<i64>,
+    notification_id: Option<i64>,
+    message: Arc<str>,
+}
+
+pub(crate) async fn get_all_errs_for_session(
+    db: &PgPool,
+    session_id: i64,
+) -> Result<SessionErrors, sqlx::Error> {
+    let errors = sqlx::query("SELECT id, time_stamp, request_id, response_id, notification_id, message FROM logs WHERE session_id = $1")
+        .bind(session_id)
+        .map(|row: sqlx::postgres::PgRow| {
+            RawErrorRow {
+                id: row.get::<i64, _>("id"),
+                time_stamp: row.get::<OffsetDateTime, _>("time_stamp"),
+                request_id: row.get::<Option<i64>, _>("request_id"),
+                response_id: row.get::<Option<i64>, _>("response_id"),
+                notification_id: row.get::<Option<i64>, _>("notification_id"),
+                message: row.get::<String, _>("message").into(),
+            }
+        })
+        .fetch_all(db)
+        .await?;
+
+    let mut session_errs = Vec::new();
+    let mut request_errs = HashMap::new();
+    let mut response_errs = HashMap::new();
+    let mut notification_errs = HashMap::new();
+
+    for err in errors {
+        let mut is_attached_to_message = false;
+        if let Some(request_id) = err.request_id {
+            is_attached_to_message = true;
+            let errs = request_errs.entry(request_id).or_insert_with(|| Vec::new());
+            errs.push(ErrorRow::from(&err));
+        }
+
+        if let Some(response_id) = err.response_id {
+            is_attached_to_message = true;
+            let errs = response_errs
+                .entry(response_id)
+                .or_insert_with(|| Vec::new());
+            errs.push(ErrorRow::from(&err));
+        }
+
+        if let Some(notification_id) = err.notification_id {
+            is_attached_to_message = true;
+            let errs = notification_errs
+                .entry(notification_id)
+                .or_insert_with(|| Vec::new());
+            errs.push(ErrorRow::from(&err));
+        }
+
+        if !is_attached_to_message {
+            session_errs.push(ErrorRow::from(&err));
+        }
+    }
+
+    Ok(SessionErrors {
+        session_id,
+        session_errs,
+        request_errs,
+        response_errs,
+        notification_errs,
+    })
 }

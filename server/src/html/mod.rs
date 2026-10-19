@@ -14,6 +14,7 @@ use crate::{
     AppState,
     html::chat_view::append_chat_html_to,
     message::{Conversation, MessageClassification, classify},
+    session::SessionErrors,
 };
 
 mod chat_view;
@@ -214,27 +215,33 @@ pub(crate) async fn get_session(
     State(state): State<AppState>,
     Query(request): Query<GetSessionParams>,
 ) -> Result<(StatusCode, HeaderMap, Html<String>), StatusCode> {
-    let session = sqlx::query("SELECT id, end_time_stamp FROM sessions WHERE id = $1 LIMIT 1;")
-        .bind(request.session_id)
-        .fetch_one(&state.db)
-        .map(|row| {
-            row.map(|row| Session {
-                id: row.get("id"),
-                end_time_stamp: row.get("end_time_stamp"),
-            })
-        })
-        .await
-        .map_err(|err| match err {
+    let (session, conversation, protocol_errs) = tokio::join!{
+        sqlx::query("SELECT id, end_time_stamp FROM sessions WHERE id = $1 LIMIT 1;")
+            .bind(request.session_id)
+            .fetch_one(&state.db)
+            .map(|row| {
+                row.map(|row| Session {
+                    id: row.get("id"),
+                    end_time_stamp: row.get("end_time_stamp"),
+                })
+            }),
+        crate::session::get_all_messages_for_session_in_chronological_order(
+            &state.db,
+            request.session_id
+        ),
+        crate::session::get_all_errs_for_session(&state.db, request.session_id)
+    };
+
+    let map_sql_err_to_http = |err| {
+        match err {
             sqlx::Error::RowNotFound => StatusCode::NOT_FOUND,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
-        })?;
+        }
+    };
 
-    let conversation = crate::session::get_all_messages_for_session_in_chronological_order(
-        &state.db,
-        request.session_id,
-    )
-    .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let session = session.map_err(map_sql_err_to_http)?;
+    let conversation = conversation.map_err(map_sql_err_to_http)?;
+    let protocol_errs = protocol_errs.map_err(map_sql_err_to_http)?;
 
     let mut html = String::new();
     html.push_str("<!DOCTYPE=html>");
@@ -257,8 +264,20 @@ pub(crate) async fn get_session(
         html.push_str(r#"<div id="page_layout">"#);
         {
             html.push_str(&generate_filtering_form(&request, &conversation));
-            let allow_list = request.build_message_classification_allow_list();
-            append_chat_html_to(&mut html, session.id, &conversation, &allow_list);
+            html.push_str("<div>");
+            {
+                html.push_str(&generate_session_errors_card(&protocol_errs));
+
+                let allow_list = request.build_message_classification_allow_list();
+                append_chat_html_to(
+                    &mut html,
+                    session.id,
+                    &conversation,
+                    &allow_list,
+                    &protocol_errs,
+                );
+            }
+            html.push_str("</div>");
         }
         html.push_str("</div>");
     }
@@ -344,5 +363,30 @@ fn generate_filtering_form(request: &GetSessionParams, conversation: &Conversati
 
     html.push_str("</form>");
 
+    html
+}
+
+fn generate_session_errors_card(protocol_errs: &SessionErrors) -> String {
+    if protocol_errs.session_errs.is_empty() {
+        return String::default();
+    }
+
+    let mut html = String::new();
+
+    html.push_str(r###"<div style="border-radius:10px; padding:16px; color: white; background: var(--client-color)">"###);
+    html.push_str("<details>");
+    html.push_str("<summary>");
+    html.push_str(r###"<h3 style="display:inline-block; color: white;">This session encountered errors</h3></summary>"###);
+    html.push_str("<ul>");
+    for err in protocol_errs.session_errs.iter() {
+        html.push_str("<li>");
+        html.push_str("<span>");
+        html.push_str(&err.message);
+        html.push_str("</span>");
+        html.push_str("</li>");
+    }
+    html.push_str("</ul>");
+    html.push_str("</details>");
+    html.push_str("</div>");
     html
 }
