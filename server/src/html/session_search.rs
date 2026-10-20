@@ -234,7 +234,7 @@ fn build_sorted_query_string(
             url.push('&');
             url.push_str("sort_asc=");
             if sort_by == (sort_column_to_toggle as usize) {
-                if request.sort_asc.unwrap_or(true) {
+                if request.sort_asc.unwrap_or(false) {
                     url.push_str(&false.to_string());
                 } else {
                     url.push_str(&true.to_string());
