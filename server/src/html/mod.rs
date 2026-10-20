@@ -379,7 +379,7 @@ fn generate_session_errors_card(protocol_errs: &SessionErrors) -> String {
     for err in protocol_errs.session_errs.iter() {
         html.push_str("<li>");
         html.push_str("<span>");
-        html.push_str(&err.message);
+        html.push_str(&html_escape::encode_text(&err.message));
         html.push_str("</span>");
         html.push_str("</li>");
     }
